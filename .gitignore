@@ -1,0 +1,6 @@
+/target
+*.onnx
+*.mp4
+*.png
+frames/
+.DS_Store
