@@ -79,10 +79,14 @@ rlextract serve --addr 127.0.0.1:8787 \
     --ocr cct_s_v2_global.onnx
 ```
 
+`video_path` accepts either a local filesystem path or an `http(s)://` URL
+(handled by ffmpeg's native HTTP protocol — one streaming GET per clip, no
+temporary files).
+
 ```
 POST /extract
 {
-  "video_path": "/media/frigate/clips/foo.mp4",
+  "video_path": "http://frigate:5000/api/events/<id>/clip.mp4",
   "known_plates": ["EL67751"],
   "plate_regex": "^[A-Z]{2}\\d{5}$"
 }
@@ -124,7 +128,7 @@ rest_command:
     method: POST
     content_type: "application/json"
     payload: >-
-      {"video_path": "{{ video_path }}",
+      {"video_path": "{{ clip_url }}",
        "known_plates": {{ known | tojson }},
        "plate_regex": "^[A-Z]{2}\\d{5}$"}
     timeout: 15
