@@ -31,7 +31,8 @@ cargo build --release
 
 ```sh
 sudo apt install build-essential pkg-config \
-    libavformat-dev libavcodec-dev libswscale-dev libavutil-dev libclang-dev
+    libavformat-dev libavcodec-dev libavfilter-dev libswscale-dev \
+    libavutil-dev libclang-dev libssl-dev
 cargo build --release
 ```
 
