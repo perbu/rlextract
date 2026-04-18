@@ -3,6 +3,12 @@ name = "rlextract"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Compile ffmpeg from source and link it statically. Required when the system
+# ffmpeg headers are non-standard (e.g. Raspberry Pi OS ships ffmpeg with
+# extra AVPixelFormat variants that break ffmpeg-next's bindings).
+static-ffmpeg = ["ffmpeg-next/build"]
+
 [dependencies]
 ffmpeg-next = "8.1"
 image = "0.25"
