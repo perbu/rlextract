@@ -7,6 +7,38 @@ use serde::{Deserialize, Serialize};
 
 use crate::pipeline::{Pipeline, PipelineOptions};
 
+enum ExtractError {
+    /// Request was syntactically fine but carried unusable data (bad regex,
+    /// malformed video_path, …). Maps to 400.
+    Client(String),
+    /// Upstream fetch (e.g. Frigate) returned 404 — clip not there. Neither
+    /// the client's fault nor ours. Maps to 502.
+    UpstreamNotFound(String),
+    /// Decode / OCR / mutex poisoning / anything server-side. Maps to 500.
+    Internal(String),
+}
+
+impl ExtractError {
+    fn into_response(self) -> (StatusCode, String) {
+        match self {
+            Self::Client(m) => (StatusCode::BAD_REQUEST, m),
+            Self::UpstreamNotFound(m) => (StatusCode::BAD_GATEWAY, m),
+            Self::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+        }
+    }
+}
+
+fn classify_pipeline_error(e: anyhow::Error) -> ExtractError {
+    // ffmpeg's `input()` surfaces HTTP status as strings like "Server returned
+    // 404 Not Found". Match on the full error chain.
+    let msg = format!("{e:#}");
+    if msg.contains("404 Not Found") {
+        ExtractError::UpstreamNotFound(msg)
+    } else {
+        ExtractError::Internal(msg)
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ExtractRequest {
     pub video_path: String,
@@ -59,7 +91,7 @@ async fn handle_extract(
     let t0 = std::time::Instant::now();
     let min_agreements_cfg = req.min_agreements.unwrap_or(2);
 
-    let result = tokio::task::spawn_blocking(move || -> Result<_, String> {
+    let result = tokio::task::spawn_blocking(move || -> Result<_, ExtractError> {
         let mut opts = PipelineOptions::default();
         opts.known_plates = req.known_plates;
         opts.min_agreements = min_agreements_cfg;
@@ -76,21 +108,34 @@ async fn handle_extract(
             opts.min_vote_gap_secs = g;
         }
         if let Some(r) = req.plate_regex {
-            opts.plate_regex =
-                Some(regex::Regex::new(&r).map_err(|e| format!("bad regex: {e}"))?);
+            opts.plate_regex = Some(
+                regex::Regex::new(&r)
+                    .map_err(|e| ExtractError::Client(format!("bad regex: {e}")))?,
+            );
         }
-        let mut pipe = pipeline.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        let mut pipe = pipeline
+            .lock()
+            .map_err(|e| ExtractError::Internal(format!("lock poisoned: {e}")))?;
         pipe.extract(Path::new(&req.video_path), &opts)
-            .map_err(|e| e.to_string())
+            .map_err(classify_pipeline_error)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))?
-    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    .map_err(ExtractError::into_response)?;
 
     let elapsed_ms = t0.elapsed().as_millis() as u64;
+    // Known plates win on any agreement count: nearest_known already enforces a
+    // tight edit-distance bound, so a single-frame known match is trustworthy
+    // even when the full min_agreements threshold isn't met.
     let (status, plate, agreements, frames_scanned) = match result {
+        Some(d) if d.known => (
+            Status::Known,
+            Some(d.plate),
+            d.agreements,
+            d.frames_scanned,
+        ),
         Some(d) if d.agreements >= min_agreements_cfg => (
-            if d.known { Status::Known } else { Status::Unknown },
+            Status::Unknown,
             Some(d.plate),
             d.agreements,
             d.frames_scanned,
