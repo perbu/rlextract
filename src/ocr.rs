@@ -123,19 +123,31 @@ impl Recognizer {
         let classes = shape[2];
         let flat = view.to_shape((slots, classes))?;
 
+        // Detect whether the graph already includes a softmax. fast-plate-ocr
+        // exports do; a plain classification head would emit raw logits.
+        let already_softmax = {
+            let row0 = flat.row(0);
+            let mn = row0.iter().cloned().fold(f32::INFINITY, f32::min);
+            let sum: f32 = row0.iter().sum();
+            mn >= 0.0 && (sum - 1.0).abs() < 1e-2
+        };
+
         let mut text = String::new();
         let mut conf_sum = 0.0f32;
         let mut conf_count = 0usize;
         for s in 0..slots {
             let row = flat.row(s);
-            let max_logit = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = row.iter().map(|v| (v - max_logit).exp()).collect();
-            let sum: f32 = exps.iter().sum();
-            let (best_idx, best_p) = exps
+            let (best_idx, best_raw) = row
                 .iter()
+                .cloned()
                 .enumerate()
-                .map(|(i, v)| (i, v / sum))
-                .fold((0, 0.0f32), |acc, x| if x.1 > acc.1 { x } else { acc });
+                .fold((0, f32::NEG_INFINITY), |acc, x| if x.1 > acc.1 { x } else { acc });
+            let best_p = if already_softmax {
+                best_raw
+            } else {
+                let denom: f32 = row.iter().map(|v| (v - best_raw).exp()).sum();
+                1.0 / denom
+            };
             if best_idx < self.alphabet.len() {
                 let ch = self.alphabet[best_idx];
                 if ch != '_' {
