@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::Result;
 use regex::Regex;
 
-use crate::decode::Decoder;
+use crate::decode::{Decoder, SweepAction};
 use crate::detect::Detector;
 use crate::ocr::{crop_bbox, Recognizer};
 
@@ -79,24 +79,21 @@ impl Pipeline {
     /// Returns `None` if no plate met the bar before the video ended.
     pub fn extract(&mut self, mp4: &Path, opts: &PipelineOptions) -> Result<Option<PlateDecision>> {
         let mut dec = Decoder::open(mp4)?;
-        let duration = dec.duration_secs();
 
         let mut votes: HashMap<String, Vec<f64>> = HashMap::new();
         let mut known_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut t = 0.0;
         let mut frames_scanned = 0usize;
+        let mut decision: Option<PlateDecision> = None;
 
-        while t < duration {
-            let Ok(frame) = dec.frame_at(t) else {
-                t += opts.interval_secs;
-                continue;
-            };
+        let detector = &mut self.detector;
+        let recognizer = &mut self.recognizer;
+
+        dec.sweep(opts.interval_secs, |t, frame| {
             frames_scanned += 1;
-
-            let boxes = self.detector.detect(&frame)?;
+            let boxes = detector.detect(&frame)?;
             for b in &boxes {
                 let crop = crop_bbox(&frame, b.x, b.y, b.w, b.h, opts.crop_pad);
-                let (text, conf) = self.recognizer.recognize(&crop)?;
+                let (text, conf) = recognizer.recognize(&crop)?;
                 if conf < opts.ocr_min_conf || text.len() < opts.min_plate_len {
                     continue;
                 }
@@ -129,16 +126,21 @@ impl Pipeline {
                 }
                 stamps.push(t);
                 if stamps.len() >= opts.min_agreements {
-                    return Ok(Some(PlateDecision {
+                    decision = Some(PlateDecision {
                         plate: canonical,
                         agreements: stamps.len(),
                         timestamps: stamps.clone(),
                         frames_scanned,
                         known: is_known,
-                    }));
+                    });
+                    return Ok(SweepAction::Stop);
                 }
             }
-            t += opts.interval_secs;
+            Ok(SweepAction::Continue)
+        })?;
+
+        if let Some(d) = decision {
+            return Ok(Some(d));
         }
 
         let best = votes.into_iter().max_by_key(|(_, v)| v.len());

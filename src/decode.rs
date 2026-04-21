@@ -136,6 +136,82 @@ impl Decoder {
 
         last_good.ok_or_else(|| anyhow!("no frame decoded at t={timestamp_secs}s"))
     }
+
+    /// Walk the stream forward from current position, emitting one frame per
+    /// `interval_secs` of PTS. No seeking — works on chunked / non-seekable
+    /// HTTP sources where `frame_at` would fail or hang.
+    ///
+    /// `on_frame(t, frame)` is called for each sampled frame. Return
+    /// `SweepAction::Continue` to keep going, or `SweepAction::Stop` to exit
+    /// early. The sweep also exits naturally at end-of-stream.
+    pub fn sweep<F>(&mut self, interval_secs: f64, mut on_frame: F) -> Result<()>
+    where
+        F: FnMut(f64, image::RgbImage) -> Result<SweepAction>,
+    {
+        let tb_num = self.stream_time_base.numerator() as f64;
+        let tb_den = self.stream_time_base.denominator() as f64;
+        let pts_to_secs = |pts: i64| (pts as f64) * tb_num / tb_den;
+
+        let stream_index = self.stream_index;
+        let scaler = &mut self.scaler;
+        let decoder = &mut self.decoder;
+        let last_frame_secs = &mut self.last_frame_secs;
+        let step = interval_secs.max(1e-6);
+
+        // Anchor the schedule on the first decoded frame's PTS — some streams
+        // start at a non-zero PTS and we want the first sample to fire anyway.
+        let mut next_target: Option<f64> = None;
+
+        let drain = |decoder: &mut ffmpeg::decoder::Video,
+                         scaler: &mut Scaler,
+                         last_frame_secs: &mut Option<f64>,
+                         next_target: &mut Option<f64>,
+                         on_frame: &mut F|
+         -> Result<SweepAction> {
+            let mut decoded = Video::empty();
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                let Some(pts) = decoded.pts() else { continue };
+                let frame_secs = pts_to_secs(pts);
+                *last_frame_secs = Some(frame_secs);
+                let target = *next_target.get_or_insert(frame_secs);
+                if frame_secs + 1e-3 < target {
+                    continue;
+                }
+                let img = scale_to_image(scaler, &decoded)?;
+                if on_frame(frame_secs, img)? == SweepAction::Stop {
+                    return Ok(SweepAction::Stop);
+                }
+                let mut t = target + step;
+                while t <= frame_secs + 1e-3 {
+                    t += step;
+                }
+                *next_target = Some(t);
+            }
+            Ok(SweepAction::Continue)
+        };
+
+        for (s, packet) in self.ictx.packets() {
+            if s.index() != stream_index {
+                continue;
+            }
+            decoder.send_packet(&packet)?;
+            if drain(decoder, scaler, last_frame_secs, &mut next_target, &mut on_frame)?
+                == SweepAction::Stop
+            {
+                return Ok(());
+            }
+        }
+
+        decoder.send_eof()?;
+        drain(decoder, scaler, last_frame_secs, &mut next_target, &mut on_frame)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepAction {
+    Continue,
+    Stop,
 }
 
 fn scale_to_image(scaler: &mut Scaler, frame: &Video) -> Result<image::RgbImage> {
